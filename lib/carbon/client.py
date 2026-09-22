@@ -230,6 +230,10 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     self.started = False
     # This factory maintains protocol state across reconnects
     self.queue = deque()  # Change to make this the sole source of metrics to be sent.
+    # High-priority (internal) metrics are modeled explicitly in their own
+    # queue so the drain order is deterministic: they are always sent ahead
+    # of regular queued metrics, including during the shutdown drain.
+    self.high_priority_queue = deque()
     self.connectedProtocol = None
     self.queueEmpty = Deferred()
     self.queueFull = Deferred()
@@ -317,18 +321,22 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     return len(self.queue)
 
   def hasQueuedDatapoints(self):
-    return bool(self.queue)
+    return bool(self.queue) or bool(self.high_priority_queue)
 
   def takeSomeFromQueue(self):
-    """Use self.queue, which is a collections.deque, to pop up to
-    settings.MAX_DATAPOINTS_PER_MESSAGE items from the left of the
-    queue.
+    """Pop up to settings.MAX_DATAPOINTS_PER_MESSAGE items to send.
+
+    High-priority datapoints are drained from self.high_priority_queue
+    first, then regular datapoints are popped from the left of
+    self.queue (both are collections.deque).
     """
     def yield_max_datapoints():
       for _ in range(settings.MAX_DATAPOINTS_PER_MESSAGE):
-        try:
+        if self.high_priority_queue:
+          yield self.high_priority_queue.popleft()
+        elif self.queue:
           yield self.queue.popleft()
-        except IndexError:
+        else:
           return
     return list(yield_max_datapoints())
 
@@ -339,7 +347,7 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     re-set the queueEmpty callback chain with a new Deferred
     object.
     """
-    if not self.queue:
+    if not self.hasQueuedDatapoints():
       self.queueEmpty.callback(0)
       self.queueEmpty = Deferred()
 
@@ -347,7 +355,7 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
     self.queue.append((metric, datapoint))
 
   def enqueue_from_left(self, metric, datapoint):
-    self.queue.appendleft((metric, datapoint))
+    self.high_priority_queue.appendleft((metric, datapoint))
 
   def sendDatapoint(self, metric, datapoint):
     instrumentation.increment(self.attemptedRelays)
@@ -369,10 +377,11 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
 
   def sendHighPriorityDatapoint(self, metric, datapoint):
     """The high priority datapoint is one relating to the carbon
-    daemon itself.  It puts the datapoint on the left of the deque,
-    ahead of other stats, so that when the carbon-relay, specifically,
-    is overwhelmed its stats are more likely to make it through and
-    expose the issue at hand.
+    daemon itself.  It puts the datapoint on the dedicated
+    high-priority queue, which is always drained ahead of the regular
+    queue, so that when the carbon-relay, specifically, is overwhelmed
+    its stats are more likely to make it through and expose the issue
+    at hand.
 
     In addition, these stats go on the deque even when the max stats
     capacity has been reached.  This relies on not creating the deque
@@ -447,22 +456,45 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
         if not self.router.countDestinations():
             state.events.pauseReceivingMetrics()
         # Re-inject queued metrics.
-        metrics = list(self.queue)
+        metrics = list(self.high_priority_queue) + list(self.queue)
         log.clients("Re-injecting %d metrics from %s" % (len(metrics), self))
         for metric, datapoint in metrics:
             state.events.metricGenerated(metric, datapoint)
         self.queue.clear()
+        self.high_priority_queue.clear()
 
   def disconnect(self):
-    self.queueEmpty.addCallbacks(lambda result: self.stopConnecting(), log.err)
+    """Drain the send queues, then stop connecting and drop the connection.
+
+    Returns a Deferred that fires once the downstream connection is
+    closed (or was never established).  The drain is one-way: no new
+    connection attempts are started and receiving is never resumed
+    while shutdown is in progress.
+    """
     readyToStop = DeferredList(
       [self.connectionLost, self.connectFailed],
       fireOnOneCallback=True,
       fireOnOneErrback=True)
+    # Capture before stopConnecting() flips it, so the fallback below
+    # only covers clients that were never started.
+    was_started = self.started
+
+    def stopConnectingWhenDrained(result):
+      had_connection = (
+        self.connectedProtocol is not None and self.connectedProtocol.connected)
+      self.stopConnecting()
+      # If there is no live connection to wait for, resolve immediately:
+      # stopTrying() may cancel a pending reconnect without ever firing
+      # connectionLost or connectFailed.
+      if not readyToStop.called and not had_connection:
+        readyToStop.callback(None)
+      return result
+
+    self.queueEmpty.addCallbacks(stopConnectingWhenDrained, log.err)
     self.checkQueue()
 
     # This can happen if the client is stopped before a connection is ever made
-    if (not readyToStop.called) and (not self.started):
+    if (not readyToStop.called) and (not was_started):
       readyToStop.callback(None)
 
     return readyToStop
@@ -581,7 +613,12 @@ class CarbonClientManager(Service):
         factory.startConnecting()
 
   def stopService(self):
+    # One-way shutdown lifecycle: flag shutdown and stop intake first,
+    # then drain the client queues and disconnect downstream.  Once
+    # state.shuttingDown is set, flow-control callbacks can no longer
+    # resume receiving.
     state.shuttingDown = True
+    state.events.pauseReceivingMetrics()
     Service.stopService(self)
     return self.stopAllClients()
 

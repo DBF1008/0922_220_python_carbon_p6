@@ -324,8 +324,139 @@ class CarbonClientShutdownDrainTest(TestCase):
 
     state.shuttingDown = True
 
-    # High-priority goes to front, regular stays at back.
-    self.assertEqual('internal.metric', factory.queue[0][0])
-    self.assertEqual('regular.metric', factory.queue[1][0])
-    # Both remain in queue for orderly drain; no resume triggered.
-    self.assertEqual(2, len(factory.queue))
+    # High-priority metrics are modeled in their own queue, drained first.
+    self.assertEqual('internal.metric', factory.high_priority_queue[0][0])
+    self.assertEqual('regular.metric', factory.queue[0][0])
+    # Both remain queued for orderly drain; no resume triggered.
+    self.assertTrue(factory.hasQueuedDatapoints())
+    drained = factory.takeSomeFromQueue()
+    self.assertEqual(
+        [('internal.metric', (1001, 2.0)), ('regular.metric', (1000, 1.0))],
+        drained)
+    self.assertFalse(factory.hasQueuedDatapoints())
+
+  def test_stop_service_pauses_receiving_before_draining(self):
+    """stopService must stop intake (one-way) before draining clients."""
+    client_mgr = CarbonClientManager(self.router_mock)
+    with patch.object(state.events, 'pauseReceivingMetrics') as prm_mock:
+      client_mgr.stopService()
+      prm_mock.assert_called_once_with()
+    self.assertTrue(state.shuttingDown)
+
+
+class CarbonClientFactoryDisconnectTest(TestCase):
+  """Regression tests for CarbonClientFactory.disconnect drain lifecycle.
+
+  Covers the connected / not-connected / queue-not-empty /
+  high-priority-metrics-present shutdown scenarios.
+  """
+  timeout = 2.0
+
+  def setUp(self):
+    self.router_mock = Mock(spec=DatapointRouter)
+    carbon_client.settings = TestSettings()
+    self.factory = CarbonPickleClientFactory(
+        ('127.0.0.1', 2003, 'a'), self.router_mock)
+    self._orig_shutting_down = state.shuttingDown
+    state.shuttingDown = True
+
+  def tearDown(self):
+    state.shuttingDown = self._orig_shutting_down
+    if self.factory.deferSendPending and self.factory.deferSendPending.active():
+      self.factory.deferSendPending.cancel()
+
+  def _connect(self):
+    protocol = Mock(spec=CarbonPickleClientProtocol)
+    protocol.connected = True
+    self.factory.connectedProtocol = protocol
+    self.factory.started = True
+    return protocol
+
+  def _simulate_connection_lost(self):
+    from twisted.python.failure import Failure
+    from twisted.internet.error import ConnectionDone
+    connector = Mock()
+    connector.host, connector.port = '127.0.0.1', 2003
+    self.factory.clientConnectionLost(connector, Failure(ConnectionDone()))
+
+  def test_disconnect_connected_empty_queue(self):
+    """Connected client with an empty queue disconnects then completes."""
+    protocol = self._connect()
+    d = self.factory.disconnect()
+    # Empty queue triggers stopConnecting immediately.
+    protocol.disconnect.assert_called_once_with()
+    self.assertFalse(self.factory.started)
+    # Still waiting for the connection to actually drop.
+    self.assertNoResult(d)
+    self._simulate_connection_lost()
+    self.successResultOf(d)
+
+  def test_disconnect_connected_queue_not_empty(self):
+    """Connected client drains its queue before disconnecting."""
+    protocol = self._connect()
+    self.factory.enqueue('metric.a', (1000, 1.0))
+    self.factory.enqueue('metric.b', (1001, 2.0))
+    d = self.factory.disconnect()
+    # Queue not empty: no disconnect yet.
+    self.assertNoResult(d)
+    protocol.disconnect.assert_not_called()
+    # Drain the queue; the empty queue triggers the disconnect.
+    self.factory.takeSomeFromQueue()
+    self.factory.checkQueue()
+    protocol.disconnect.assert_called_once_with()
+    self.assertNoResult(d)
+    self._simulate_connection_lost()
+    self.successResultOf(d)
+
+  def test_disconnect_not_connected_never_started(self):
+    """Client stopped before ever connecting completes immediately."""
+    d = self.factory.disconnect()
+    self.successResultOf(d)
+
+  def test_disconnect_not_connected_but_started(self):
+    """Client stuck connecting must not hang the shutdown drain."""
+    self.factory.started = True
+    self.factory.connectedProtocol = None
+    d = self.factory.disconnect()
+    # No live connection to wait for: resolves without hanging on
+    # connectionLost/connectFailed that stopTrying() may never produce.
+    self.successResultOf(d)
+    self.assertFalse(self.factory.started)
+
+  def test_disconnect_waits_for_high_priority_metrics(self):
+    """High-priority metrics queued at shutdown are drained before disconnect."""
+    protocol = self._connect()
+    self.factory.enqueue('regular.metric', (1000, 1.0))
+    self.factory.sendHighPriorityDatapoint('internal.metric', (1001, 2.0))
+    d = self.factory.disconnect()
+    self.assertNoResult(d)
+    protocol.disconnect.assert_not_called()
+    # High-priority metrics drain first, then regular ones.
+    batch = self.factory.takeSomeFromQueue()
+    self.assertEqual(
+        [('internal.metric', (1001, 2.0)), ('regular.metric', (1000, 1.0))],
+        batch)
+    self.factory.checkQueue()
+    protocol.disconnect.assert_called_once_with()
+    self._simulate_connection_lost()
+    self.successResultOf(d)
+
+  def test_check_queue_not_empty_with_only_high_priority(self):
+    """queueEmpty must not fire while high-priority metrics remain."""
+    self.factory.sendHighPriorityDatapoint('internal.metric', (1001, 2.0))
+    self.factory.checkQueue()
+    self.assertFalse(self.factory.queueEmpty.called)
+    queue_empty = self.factory.queueEmpty
+    self.factory.takeSomeFromQueue()
+    self.factory.checkQueue()
+    self.assertTrue(queue_empty.called)
+
+  def test_high_priority_queue_drains_in_order_before_regular(self):
+    """Drain order is explicit: high-priority queue first, then regular."""
+    self.factory.enqueue('regular.metric', (1000, 1.0))
+    self.factory.sendHighPriorityDatapoint('internal.a', (1001, 2.0))
+    self.factory.sendHighPriorityDatapoint('internal.b', (1002, 3.0))
+    batch = self.factory.takeSomeFromQueue()
+    self.assertEqual(
+        ['internal.b', 'internal.a', 'regular.metric'],
+        [metric for metric, _ in batch])

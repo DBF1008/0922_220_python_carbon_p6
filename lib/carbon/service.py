@@ -162,6 +162,27 @@ def setupReceivers(root_service, settings):
     plugin_class.build(root_service)
 
 
+def resumeReceivingMetricsUnlessShuttingDown():
+  """Resume receiving metrics only while the service is not shutting down.
+
+  Backpressure is one-directional during shutdown: once the drain
+  lifecycle begins, a queue dropping below its watermark must not
+  re-open intake.
+  """
+  if not state.shuttingDown:
+    events.resumeReceivingMetrics()
+
+
+def setupFlowControl():
+  """Bind cache flow-control events to receiver pause/resume.
+
+  The pause path is always active, while the resume path is guarded so
+  that shutdown keeps backpressure semantics one-way (closed).
+  """
+  events.cacheFull.addHandler(events.pauseReceivingMetrics)
+  events.cacheSpaceAvailable.addHandler(resumeReceivingMetricsUnlessShuttingDown)
+
+
 def setupAggregatorProcessor(root_service, settings):
   from carbon.aggregator.processor import AggregationProcessor  # NOQA Register the plugin class
   from carbon.aggregator.rules import RuleManager
@@ -173,8 +194,7 @@ def setupAggregatorProcessor(root_service, settings):
   RuleManager.read_from(aggregation_rules_path)
 
   if settings.USE_FLOW_CONTROL:
-    events.cacheFull.addHandler(events.pauseReceivingMetrics)
-    events.cacheSpaceAvailable.addHandler(events.resumeReceivingMetrics)
+    setupFlowControl()
 
 
 def setupRewriterProcessor(root_service, settings):
@@ -184,8 +204,7 @@ def setupRewriterProcessor(root_service, settings):
   RewriteRuleManager.read_from(rewrite_rules_path)
 
   if settings.USE_FLOW_CONTROL:
-    events.cacheFull.addHandler(events.pauseReceivingMetrics)
-    events.cacheSpaceAvailable.addHandler(events.resumeReceivingMetrics)
+    setupFlowControl()
 
 
 def setupRelayProcessor(root_service, settings):
@@ -202,8 +221,7 @@ def setupRelayProcessor(root_service, settings):
     state.client_manager.startClient(destination)
 
   if settings.USE_FLOW_CONTROL:
-    events.cacheFull.addHandler(events.pauseReceivingMetrics)
-    events.cacheSpaceAvailable.addHandler(events.resumeReceivingMetrics)
+    setupFlowControl()
 
 
 def setupWriterProcessor(root_service, settings):
@@ -223,5 +241,4 @@ def setupWriterProcessor(root_service, settings):
   writer_service.setServiceParent(root_service)
 
   if settings.USE_FLOW_CONTROL:
-    events.cacheFull.addHandler(events.pauseReceivingMetrics)
-    events.cacheSpaceAvailable.addHandler(events.resumeReceivingMetrics)
+    setupFlowControl()

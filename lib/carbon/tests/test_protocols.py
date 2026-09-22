@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from carbon.protocols import MetricReceiver, MetricLineReceiver, \
     MetricDatagramReceiver, MetricPickleReceiver
-from carbon import events
+from carbon import events, state
 from unittest import TestCase
 from mock import Mock, patch, call
 from carbon.cache import _MetricCache
@@ -43,6 +43,33 @@ class TestMetricReceiversHandler(TestCase):
 
     for plugin_name, plugin_class in MetricReceiver.plugins.items():
       plugin_class.build(fake_service)
+
+
+class TestMetricReceiverShutdownFlowControl(TestCase):
+    """resumeReceiving must stay one-way (closed) during shutdown."""
+
+    def setUp(self):
+        self.receiver = MetricReceiver()
+        self.receiver.transport = Mock()
+        self._orig_shutting_down = state.shuttingDown
+
+    def tearDown(self):
+        state.shuttingDown = self._orig_shutting_down
+
+    def test_resume_receiving_suppressed_during_shutdown(self):
+        state.shuttingDown = True
+        self.receiver.resumeReceiving()
+        self.receiver.transport.resumeProducing.assert_not_called()
+
+    def test_resume_receiving_works_when_running(self):
+        state.shuttingDown = False
+        self.receiver.resumeReceiving()
+        self.receiver.transport.resumeProducing.assert_called_once_with()
+
+    def test_pause_receiving_still_works_during_shutdown(self):
+        state.shuttingDown = True
+        self.receiver.pauseReceiving()
+        self.receiver.transport.pauseProducing.assert_called_once_with()
 
 
 class TestMetricReceiver(TestCase):
