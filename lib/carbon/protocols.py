@@ -146,6 +146,10 @@ class MetricReceiver(CarbonServerProtocol, TimeoutMixin):
     self.transport.pauseProducing()
 
   def resumeReceiving(self):
+    # Backpressure is one-directional during shutdown: never re-open
+    # the receiving side while the service is draining its queues.
+    if state.shuttingDown:
+      return
     self.transport.resumeProducing()
 
   def connectionLost(self, reason):

@@ -3,7 +3,7 @@ from unittest import TestCase
 
 from carbon import events, state
 from carbon.pipeline import Processor, run_pipeline, run_pipeline_generated
-from carbon.service import CarbonRootService, setupPipeline
+from carbon.service import CarbonRootService, setupFlowControl, setupPipeline
 from carbon.tests.util import TestSettings
 
 
@@ -63,3 +63,46 @@ class TestSetupPipeline(TestCase):
   def test_schedules_pipeline_ready(self):
     setupPipeline([], self.root_service_mock, self.settings)
     self.assertTrue(self.call_when_running_mock.called)
+
+
+class TestSetupFlowControl(TestCase):
+  """Flow control must be one-directional during shutdown: cacheFull may
+  always pause receiving, but cacheSpaceAvailable must never resume it
+  once the service has started draining."""
+
+  def setUp(self):
+    self._orig_shutting_down = state.shuttingDown
+    self._orig_receivers_paused = state.metricReceiversPaused
+    self._cache_full_handlers = list(events.cacheFull.handlers)
+    self._space_available_handlers = list(events.cacheSpaceAvailable.handlers)
+
+  def tearDown(self):
+    state.shuttingDown = self._orig_shutting_down
+    state.metricReceiversPaused = self._orig_receivers_paused
+    events.cacheFull.handlers = self._cache_full_handlers
+    events.cacheSpaceAvailable.handlers = self._space_available_handlers
+
+  def test_cache_full_pauses_receiving(self):
+    setupFlowControl()
+    self.assertTrue(events.pauseReceivingMetrics in events.cacheFull.handlers)
+
+  def test_cache_full_pauses_receiving_even_during_shutdown(self):
+    setupFlowControl()
+    state.shuttingDown = True
+    state.metricReceiversPaused = False
+    events.cacheFull()
+    self.assertTrue(state.metricReceiversPaused)
+
+  def test_cache_space_available_resumes_receiving_when_running(self):
+    setupFlowControl()
+    state.shuttingDown = False
+    with patch.object(events, 'resumeReceivingMetrics') as resume_mock:
+      events.cacheSpaceAvailable()
+      resume_mock.assert_called_once_with()
+
+  def test_cache_space_available_suppressed_during_shutdown(self):
+    setupFlowControl()
+    state.shuttingDown = True
+    with patch.object(events, 'resumeReceivingMetrics') as resume_mock:
+      events.cacheSpaceAvailable()
+      resume_mock.assert_not_called()

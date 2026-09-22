@@ -11,7 +11,9 @@ import carbon.service  # NOQA
 from twisted.internet import reactor
 from twisted.internet.defer import Deferred
 from twisted.internet.base import DelayedCall
+from twisted.internet.error import ConnectionDone
 from twisted.internet.task import deferLater
+from twisted.python.failure import Failure
 from twisted.trial.unittest import TestCase
 from twisted.test.proto_helpers import StringTransport
 
@@ -329,3 +331,129 @@ class CarbonClientShutdownDrainTest(TestCase):
     self.assertEqual('regular.metric', factory.queue[1][0])
     # Both remain in queue for orderly drain; no resume triggered.
     self.assertEqual(2, len(factory.queue))
+
+
+class CarbonClientFactoryDisconnectTest(TestCase):
+  """Regression tests for the converged shutdown drain lifecycle.
+
+  disconnect() must stop reconnecting immediately, drain the send queue
+  (high-priority internal metrics first), then drop the downstream
+  connection and wait for it to close. When there is no connection it
+  must stop right away instead of waiting on queueEmpty forever.
+  """
+  timeout = 2.0
+
+  def setUp(self):
+    self.router_mock = Mock(spec=DatapointRouter)
+    self.router_mock.hasDestination = Mock(return_value=True)
+    carbon_client.settings = TestSettings()
+    self._orig_shutting_down = state.shuttingDown
+    state.shuttingDown = True
+    self.destination = ('127.0.0.1', 2003, 'a')
+
+  def tearDown(self):
+    state.shuttingDown = self._orig_shutting_down
+    for factory in getattr(self, '_factories', []):
+      if factory.deferSendPending and factory.deferSendPending.active():
+        factory.deferSendPending.cancel()
+
+  def _make_factory(self):
+    factory = CarbonPickleClientFactory(self.destination, self.router_mock)
+    self._factories = getattr(self, '_factories', []) + [factory]
+    return factory
+
+  def _make_connected_factory(self):
+    factory = self._make_factory()
+    protocol = factory.buildProtocol(None)
+    transport = StringTransport()
+    transport.loseConnection = Mock()
+    protocol.makeConnection(transport)
+    factory.started = True
+    return factory, protocol, transport
+
+  def test_disconnect_connected_drains_queue_before_dropping_connection(self):
+    """Connected client: drain queue first, then drop the connection."""
+    factory, protocol, transport = self._make_connected_factory()
+    factory.enqueue('regular.metric', (1000, 1.0))
+
+    results = []
+    d = factory.disconnect()
+    d.addBoth(results.append)
+
+    # Reconnecting stopped immediately; connection still up while draining.
+    self.assertFalse(factory.continueTrying)
+    self.assertTrue(protocol.connected)
+    transport.loseConnection.assert_not_called()
+    self.assertEqual([], results)
+
+    # Drain the queue; queueEmpty then triggers the disconnect.
+    while factory.hasQueuedDatapoints():
+      factory.takeSomeFromQueue()
+    factory.checkQueue()
+
+    self.assertFalse(protocol.connected)
+    transport.loseConnection.assert_called_once_with()
+    self.assertEqual([], results)  # still waiting for the connection to close
+
+    factory.clientConnectionLost(Mock(), Failure(ConnectionDone()))
+    self.assertEqual(1, len(results))
+
+  def test_disconnect_connected_empty_queue_disconnects_immediately(self):
+    """Connected client with empty queue: connection dropped right away."""
+    factory, protocol, transport = self._make_connected_factory()
+
+    results = []
+    d = factory.disconnect()
+    d.addBoth(results.append)
+
+    self.assertFalse(protocol.connected)
+    transport.loseConnection.assert_called_once_with()
+    self.assertEqual([], results)
+
+    factory.clientConnectionLost(Mock(), Failure(ConnectionDone()))
+    self.assertEqual(1, len(results))
+
+  def test_disconnect_not_connected_stops_immediately(self):
+    """Not-connected client: stop immediately, never wait on queueEmpty."""
+    factory = self._make_factory()
+    factory.started = True  # a connection attempt is in progress
+    factory.enqueue('stuck.metric', (1000, 1.0))
+
+    results = []
+    d = factory.disconnect()
+    d.addBoth(results.append)
+
+    self.assertEqual(1, len(results))
+    self.assertFalse(factory.started)
+    self.assertFalse(factory.continueTrying)
+
+  def test_disconnect_never_started_stops_immediately(self):
+    """Client stopped before any connection attempt: stop immediately."""
+    factory = self._make_factory()
+    self.assertFalse(factory.started)
+
+    results = []
+    d = factory.disconnect()
+    d.addBoth(results.append)
+
+    self.assertEqual(1, len(results))
+
+  def test_disconnect_flushes_high_priority_metrics_first(self):
+    """High-priority internal metrics drain ahead of regular metrics."""
+    factory, protocol, transport = self._make_connected_factory()
+    factory.enqueue('regular.metric.1', (1000, 1.0))
+    factory.enqueue('regular.metric.2', (1001, 2.0))
+    factory.sendHighPriorityDatapoint('internal.metric', (1002, 3.0))
+
+    factory.disconnect()
+
+    first_batch = factory.takeSomeFromQueue()
+    self.assertEqual('internal.metric', first_batch[0][0])
+    self.assertEqual(
+        ['internal.metric', 'regular.metric.1', 'regular.metric.2'],
+        [metric for metric, _ in first_batch])
+
+    # Finishing the drain releases the connection.
+    factory.checkQueue()
+    self.assertFalse(protocol.connected)
+    transport.loseConnection.assert_called_once_with()

@@ -454,15 +454,32 @@ class CarbonClientFactory(with_metaclass(PluginRegistrar, ReconnectingClientFact
         self.queue.clear()
 
   def disconnect(self):
-    self.queueEmpty.addCallbacks(lambda result: self.stopConnecting(), log.err)
-    readyToStop = DeferredList(
-      [self.connectionLost, self.connectFailed],
-      fireOnOneCallback=True,
-      fireOnOneErrback=True)
-    self.checkQueue()
+    """Converged shutdown drain lifecycle.
 
-    # This can happen if the client is stopped before a connection is ever made
-    if (not readyToStop.called) and (not self.started):
+    1. Stop reconnecting immediately: shutdown is one-directional, no
+       new downstream connections may be established while draining.
+    2. Drain the send queue. High-priority datapoints sit at the front
+       of the deque, so internal metrics are flushed first.
+    3. Once the queue is empty, drop the downstream connection and wait
+       for it to close (or for a connect attempt to fail).
+
+    If there is no usable connection the queue cannot be drained, so we
+    stop right away instead of waiting on queueEmpty forever.
+    """
+    self.stopTrying()
+    if self.connectedProtocol and self.connectedProtocol.connected:
+      # Drain the queue before tearing down the connection.
+      self.queueEmpty.addCallbacks(lambda result: self.stopConnecting(), log.err)
+      readyToStop = DeferredList(
+        [self.connectionLost, self.connectFailed],
+        fireOnOneCallback=True,
+        fireOnOneErrback=True)
+      self.checkQueue()
+    else:
+      # Not connected (or never started): nothing can be drained
+      # downstream, so shut down immediately.
+      self.stopConnecting()
+      readyToStop = Deferred()
       readyToStop.callback(None)
 
     return readyToStop
